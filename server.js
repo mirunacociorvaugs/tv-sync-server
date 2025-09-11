@@ -336,26 +336,38 @@ function handleClientMessage(clientId, data) {
                 const config = wallConfigs.get(clientId);
                 const adminGroup = adminGroups.get(clientId);
                 
-                if (config && adminGroup) {
+                console.log(`Sync requested by admin ${clientId}`);
+                console.log('Config:', config);
+                console.log('Admin group size:', adminGroup ? adminGroup.size : 0);
+                
+                if (config) {
+                    // Merge any config sent with sync command
+                    const mergedConfig = { ...config, ...data.config };
+                    
                     const syncData = {
                         type: 'sync',
-                        config: config,
-                        syncTime: Date.now() + 2000, // Start 2 seconds from now
-                        ...data
+                        config: mergedConfig,
+                        syncTime: Date.now() + 2000 // Start 2 seconds from now
                     };
                     
                     // Send to admin itself
                     client.ws.send(JSON.stringify(syncData));
+                    console.log(`Sent sync to admin ${clientId}`);
                     
                     // Send to all paired clients
-                    adminGroup.forEach(pairedClientId => {
-                        const pairedClient = clients.get(pairedClientId);
-                        if (pairedClient && pairedClient.ws.readyState === WebSocket.OPEN) {
-                            pairedClient.ws.send(JSON.stringify(syncData));
-                        }
-                    });
+                    if (adminGroup) {
+                        adminGroup.forEach(pairedClientId => {
+                            const pairedClient = clients.get(pairedClientId);
+                            if (pairedClient && pairedClient.ws.readyState === WebSocket.OPEN) {
+                                pairedClient.ws.send(JSON.stringify(syncData));
+                                console.log(`Sent sync to client ${pairedClientId}`);
+                            }
+                        });
+                    }
                     
-                    console.log(`Sync command sent from admin ${clientId} to ${adminGroup.size} paired clients`);
+                    console.log(`Sync command sent from admin ${clientId} to ${adminGroup ? adminGroup.size : 0} paired clients`);
+                } else {
+                    console.log(`No config found for admin ${clientId}`);
                 }
             }
             break;
