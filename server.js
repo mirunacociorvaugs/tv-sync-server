@@ -49,7 +49,7 @@ app.get('/time', (req, res) => {
 
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
-    const clientId = Date.now().toString();
+    const clientId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     console.log(`Client connected: ${clientId}`);
     
     // Store client info
@@ -91,13 +91,16 @@ wss.on('connection', (ws, req) => {
         if (client) {
             // Clean up admin data
             if (client.mode === 'admin') {
+                // Get paired clients BEFORE deleting the admin group
+                const pairedClients = adminGroups.get(clientId);
+                
+                // Now clean up admin data
                 adminClients.delete(clientId);
                 adminGroups.delete(clientId);
                 wallConfigs.delete(clientId);
                 
                 // Notify paired clients that admin disconnected
-                const pairedClients = adminGroups.get(clientId);
-                if (pairedClients) {
+                if (pairedClients && pairedClients.size > 0) {
                     pairedClients.forEach(pairedClientId => {
                         const pairedClient = clients.get(pairedClientId);
                         if (pairedClient) {
@@ -105,7 +108,7 @@ wss.on('connection', (ws, req) => {
                             pairedClient.deviceIndex = null;
                             clientPairings.delete(pairedClientId);
                             
-                            if (pairedClient.ws.readyState === WebSocket.OPEN) {
+                            if (pairedClient.ws && pairedClient.ws.readyState === WebSocket.OPEN) {
                                 pairedClient.ws.send(JSON.stringify({
                                     type: 'unpaired',
                                     reason: 'Admin disconnected'
@@ -185,6 +188,7 @@ function handleClientMessage(clientId, data) {
                 
                 client.ws.send(JSON.stringify({
                     type: 'clientList',
+                    adminId: clientId,
                     clients: clientList,
                     pairedClients: Array.from(adminGroups.get(clientId) || [])
                 }));
@@ -442,6 +446,7 @@ function broadcastClientList() {
             
             admin.ws.send(JSON.stringify({
                 type: 'clientList',
+                adminId: adminId,
                 clients: clientList,
                 pairedClients: Array.from(adminGroups.get(adminId) || [])
             }));
