@@ -4,6 +4,7 @@ const http = require('http');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 const app = express();
@@ -23,11 +24,13 @@ const wss = new WebSocket.Server({ server });
 const clients = new Map();
 const adminClients = new Set();
 
-// PIN-based pairing system
-const activePins = new Map(); // pin -> {adminId, timestamp, clientIds (Set)}
+// PIN-based pairing system with approval
+const activePins = new Map(); // pin -> {adminId, timestamp, usedBy (Set), maxUses}
+const pendingApprovals = new Map(); // clientId -> {adminId, pin, timestamp}
 const clientPairings = new Map(); // clientId -> adminId
 const adminGroups = new Map(); // adminId -> Set of clientIds
 const adminPins = new Map(); // adminId -> pin
+const usedPins = new Set(); // Recently used PINs to prevent reuse
 
 // Wall configurations per admin
 const wallConfigs = new Map(); // adminId -> config
@@ -48,9 +51,24 @@ const messageLimiter = new RateLimiterMemory({
     duration: 60, // Per 60 seconds
 });
 
-// Generate a random 6-digit PIN
+// Generate a cryptographically secure 6-digit PIN
 function generatePin() {
-    return String(Math.floor(100000 + Math.random() * 900000));
+    let pin;
+    let attempts = 0;
+    const maxAttempts = 100;
+    
+    do {
+        pin = crypto.randomInt(100000, 1000000).toString();
+        attempts++;
+        if (attempts > maxAttempts) {
+            // If we can't find a unique PIN, clear old ones and try again
+            usedPins.clear();
+            pin = crypto.randomInt(100000, 1000000).toString();
+            break;
+        }
+    } while (activePins.has(pin) || usedPins.has(pin));
+    
+    return pin;
 }
 
 // Clean up expired PINs (expire after 5 minutes)
@@ -70,13 +88,21 @@ function cleanupExpiredPins() {
             }
             
             // Clean up all clients that used this PIN
-            if (data.clientIds && data.clientIds.size > 0) {
-                console.log(`Cleaning up ${data.clientIds.size} clients from expired PIN ${pin}`);
+            if (data.usedBy && data.usedBy.size > 0) {
+                console.log(`Cleaning up ${data.usedBy.size} clients from expired PIN ${pin}`);
             }
+            
+            // Add to used PINs to prevent immediate reuse
+            usedPins.add(pin);
             
             adminPins.delete(data.adminId);
             activePins.delete(pin);
         }
+    }
+    
+    // Clean up old used PINs (older than 30 minutes)
+    if (usedPins.size > 1000) {
+        usedPins.clear();
     }
 }
 
@@ -169,9 +195,9 @@ wss.on('connection', (ws, req) => {
                 if (pin) {
                     const pinData = activePins.get(pin);
                     if (pinData) {
-                        // Notify all clients paired with this PIN
-                        if (pinData.clientIds && pinData.clientIds.size > 0) {
-                            pinData.clientIds.forEach(pairedClientId => {
+                        // Notify all clients that used this PIN
+                        if (pinData.usedBy && pinData.usedBy.size > 0) {
+                            pinData.usedBy.forEach(pairedClientId => {
                                 const pairedClient = clients.get(pairedClientId);
                                 if (pairedClient && pairedClient.ws && pairedClient.ws.readyState === WebSocket.OPEN) {
                                     pairedClient.ws.send(JSON.stringify({
@@ -182,6 +208,7 @@ wss.on('connection', (ws, req) => {
                             });
                         }
                     }
+                    usedPins.add(pin);
                     activePins.delete(pin);
                     adminPins.delete(clientId);
                 }
@@ -216,10 +243,23 @@ wss.on('connection', (ws, req) => {
                 clientPairings.delete(clientId);
             }
             
+            // Remove client from any pending approvals
+            if (pendingApprovals.has(clientId)) {
+                const pending = pendingApprovals.get(clientId);
+                const admin = clients.get(pending.adminId);
+                if (admin && admin.ws && admin.ws.readyState === WebSocket.OPEN) {
+                    admin.ws.send(JSON.stringify({
+                        type: 'approvalCancelled',
+                        clientId: clientId
+                    }));
+                }
+                pendingApprovals.delete(clientId);
+            }
+            
             // Remove client from any PIN groups they joined
             for (const [pin, data] of activePins.entries()) {
-                if (data.clientIds && data.clientIds.has(clientId)) {
-                    data.clientIds.delete(clientId);
+                if (data.usedBy && data.usedBy.has(clientId)) {
+                    data.usedBy.delete(clientId);
                 }
             }
         }
@@ -247,6 +287,8 @@ async function handleClientMessage(clientId, data) {
             client.mode = data.mode;
             client.name = data.name || `${data.mode}-${clientId.slice(-4)}`;
             
+            console.log(`Client ${clientId} registering as ${data.mode} (${client.name})`);
+            
             if (data.mode === 'admin') {
                 adminClients.add(clientId);
                 adminGroups.set(clientId, new Set());
@@ -257,6 +299,7 @@ async function handleClientMessage(clientId, data) {
                     mediaUrl: '',
                     source: 'direct'
                 });
+                console.log(`Admin ${clientId} fully registered`);
             }
             
             console.log(`Client ${clientId} registered as ${data.mode} (${client.name})`);
@@ -288,6 +331,7 @@ async function handleClientMessage(clientId, data) {
             
         case 'generatePin':
             // Admin generates a new PIN for pairing
+            console.log(`Received generatePin request from ${clientId} (mode: ${client.mode})`);
             if (client.mode === 'admin') {
                 try {
                     // Apply rate limiting for PIN generation
@@ -300,17 +344,16 @@ async function handleClientMessage(clientId, data) {
                     }
                     
                     // Generate new PIN
-                    let pin;
-                    do {
-                        pin = generatePin();
-                    } while (activePins.has(pin));
+                    const pin = generatePin();
+                    console.log(`Generating PIN ${pin} for admin ${clientId}`);
                     
-                    // Store PIN
+                    // Store PIN with usage limits
                     activePins.set(pin, {
                         adminId: clientId,
                         adminName: client.name,
                         timestamp: Date.now(),
-                        clientIds: new Set()
+                        usedBy: new Set(),
+                        maxUses: 10 // Allow up to 10 connections per PIN
                     });
                     adminPins.set(clientId, pin);
                     
@@ -355,47 +398,51 @@ async function handleClientMessage(clientId, data) {
                             return;
                         }
                         
+                        // Check if PIN has reached max uses
+                        if (pinData.usedBy.size >= pinData.maxUses) {
+                            client.ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'This PIN has reached its maximum number of uses'
+                            }));
+                            return;
+                        }
+                        
+                        // Check if client already has a pending approval
+                        if (pendingApprovals.has(clientId)) {
+                            client.ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'You already have a pending connection request'
+                            }));
+                            return;
+                        }
+                        
                         // Valid PIN found
                         const admin = clients.get(pinData.adminId);
                         
                         if (admin && admin.ws && admin.ws.readyState === WebSocket.OPEN) {
-                            // Remove any existing pairing
-                            if (client.pairedWith) {
-                                const oldAdminGroup = adminGroups.get(client.pairedWith);
-                                if (oldAdminGroup) {
-                                    oldAdminGroup.delete(clientId);
-                                }
-                            }
+                            // Store pending approval
+                            pendingApprovals.set(clientId, {
+                                adminId: pinData.adminId,
+                                pin: data.pin,
+                                timestamp: Date.now(),
+                                clientName: client.name
+                            });
                             
-                            // Pair client with admin
-                            client.pairedWith = pinData.adminId;
-                            clientPairings.set(clientId, pinData.adminId);
-                            
-                            const adminGroup = adminGroups.get(pinData.adminId);
-                            if (adminGroup) {
-                                adminGroup.add(clientId);
-                            }
-                            
-                            // Add client to PIN group
-                            pinData.clientIds.add(clientId);
-                            
-                            // Notify admin
+                            // Request approval from admin
                             admin.ws.send(JSON.stringify({
-                                type: 'clientPaired',
+                                type: 'approvalRequest',
                                 clientId: clientId,
                                 clientName: client.name,
                                 pin: data.pin
                             }));
                             
-                            // Notify client
+                            // Notify client that request was sent
                             client.ws.send(JSON.stringify({
-                                type: 'paired',
-                                adminId: pinData.adminId,
+                                type: 'approvalPending',
                                 adminName: pinData.adminName
                             }));
                             
-                            console.log(`Client ${clientId} paired with admin ${pinData.adminId} using PIN ${data.pin}`);
-                            broadcastClientList();
+                            console.log(`Client ${clientId} requested pairing with admin ${pinData.adminId} using PIN ${data.pin}`);
                         } else {
                             // Admin is no longer connected
                             client.ws.send(JSON.stringify({
@@ -425,12 +472,13 @@ async function handleClientMessage(clientId, data) {
             break;
             
         case 'assignIndex':
-            // Admin assigns index to paired client
+            // Admin assigns index to paired client - multiple devices can have same index
             if (client.mode === 'admin' && data.clientId) {
                 const targetClient = clients.get(data.clientId);
                 const adminGroup = adminGroups.get(clientId);
                 
                 if (targetClient && adminGroup && adminGroup.has(data.clientId)) {
+                    // No checking for duplicate indices - allow multiple devices to show same portion
                     targetClient.deviceIndex = data.index;
                     
                     // Notify client of index assignment
@@ -439,11 +487,6 @@ async function handleClientMessage(clientId, data) {
                         index: data.index
                     }));
                     
-                    // Also assign to admin if it's self-assignment
-                    if (data.clientId === clientId) {
-                        client.deviceIndex = data.index;
-                    }
-                    
                     console.log(`Admin ${clientId} assigned index ${data.index} to client ${data.clientId}`);
                     broadcastClientList();
                 }
@@ -451,7 +494,7 @@ async function handleClientMessage(clientId, data) {
             break;
             
         case 'assignSelfIndex':
-            // Admin assigns index to themselves
+            // Admin assigns index to themselves - no restrictions
             if (client.mode === 'admin') {
                 client.deviceIndex = data.index;
                 console.log(`Admin ${clientId} assigned index ${data.index} to self`);
@@ -599,6 +642,96 @@ async function handleClientMessage(clientId, data) {
             
         case 'setPairingPreference':
             // Removed - no longer using direct pairing preferences with PIN system
+            break;
+            
+        case 'approveClient':
+            // Admin approves a client connection
+            if (client.mode === 'admin' && data.clientId) {
+                const pending = pendingApprovals.get(data.clientId);
+                
+                if (!pending) {
+                    client.ws.send(JSON.stringify({
+                        type: 'error',
+                        message: 'No pending approval for this client'
+                    }));
+                    return;
+                }
+                
+                if (pending.adminId !== clientId) {
+                    client.ws.send(JSON.stringify({
+                        type: 'error',
+                        message: 'This client is not requesting to connect to you'
+                    }));
+                    return;
+                }
+                
+                const targetClient = clients.get(data.clientId);
+                const pinData = activePins.get(pending.pin);
+                
+                if (targetClient && pinData) {
+                    // Remove any existing pairing
+                    if (targetClient.pairedWith) {
+                        const oldAdminGroup = adminGroups.get(targetClient.pairedWith);
+                        if (oldAdminGroup) {
+                            oldAdminGroup.delete(data.clientId);
+                        }
+                    }
+                    
+                    // Pair client with admin
+                    targetClient.pairedWith = clientId;
+                    clientPairings.set(data.clientId, clientId);
+                    
+                    const adminGroup = adminGroups.get(clientId);
+                    if (adminGroup) {
+                        adminGroup.add(data.clientId);
+                    }
+                    
+                    // Mark PIN as used by this client
+                    pinData.usedBy.add(data.clientId);
+                    
+                    // Notify client of successful pairing
+                    targetClient.ws.send(JSON.stringify({
+                        type: 'paired',
+                        adminId: clientId,
+                        adminName: client.name
+                    }));
+                    
+                    // Confirm to admin
+                    client.ws.send(JSON.stringify({
+                        type: 'clientPaired',
+                        clientId: data.clientId,
+                        clientName: targetClient.name
+                    }));
+                    
+                    console.log(`Admin ${clientId} approved pairing with client ${data.clientId}`);
+                    broadcastClientList();
+                }
+                
+                // Clean up pending approval
+                pendingApprovals.delete(data.clientId);
+            }
+            break;
+            
+        case 'rejectClient':
+            // Admin rejects a client connection
+            if (client.mode === 'admin' && data.clientId) {
+                const pending = pendingApprovals.get(data.clientId);
+                
+                if (pending && pending.adminId === clientId) {
+                    const targetClient = clients.get(data.clientId);
+                    
+                    if (targetClient) {
+                        targetClient.ws.send(JSON.stringify({
+                            type: 'approvalRejected',
+                            adminName: client.name,
+                            reason: data.reason || 'Connection rejected by admin'
+                        }));
+                    }
+                    
+                    console.log(`Admin ${clientId} rejected pairing with client ${data.clientId}`);
+                    pendingApprovals.delete(data.clientId);
+                }
+            }
             break;
             
         case 'ping':
