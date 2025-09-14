@@ -4,6 +4,7 @@ const http = require('http');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 const app = express();
 app.use(cors());
@@ -22,13 +23,65 @@ const wss = new WebSocket.Server({ server });
 const clients = new Map();
 const adminClients = new Set();
 
-// Pairing system
-const pairingRequests = new Map(); // clientId -> {adminId, timestamp}
+// PIN-based pairing system
+const activePins = new Map(); // pin -> {adminId, timestamp, clientIds (Set)}
 const clientPairings = new Map(); // clientId -> adminId
 const adminGroups = new Map(); // adminId -> Set of clientIds
+const adminPins = new Map(); // adminId -> pin
 
 // Wall configurations per admin
 const wallConfigs = new Map(); // adminId -> config
+
+// Rate limiters
+const pinGenerationLimiter = new RateLimiterMemory({
+    points: 3, // Number of PIN generations allowed
+    duration: 60, // Per 60 seconds
+});
+
+const pinAttemptLimiter = new RateLimiterMemory({
+    points: 5, // Number of PIN attempts allowed
+    duration: 60, // Per 60 seconds
+});
+
+const messageLimiter = new RateLimiterMemory({
+    points: 100, // Number of messages allowed
+    duration: 60, // Per 60 seconds
+});
+
+// Generate a random 6-digit PIN
+function generatePin() {
+    return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// Clean up expired PINs (expire after 5 minutes)
+function cleanupExpiredPins() {
+    const now = Date.now();
+    const expireTime = 5 * 60 * 1000; // 5 minutes
+    
+    for (const [pin, data] of activePins.entries()) {
+        if (now - data.timestamp > expireTime) {
+            // Notify admin that PIN expired
+            const admin = clients.get(data.adminId);
+            if (admin && admin.ws && admin.ws.readyState === WebSocket.OPEN) {
+                admin.ws.send(JSON.stringify({
+                    type: 'pinExpired',
+                    pin: pin
+                }));
+            }
+            
+            // Clean up all clients that used this PIN
+            if (data.clientIds && data.clientIds.size > 0) {
+                console.log(`Cleaning up ${data.clientIds.size} clients from expired PIN ${pin}`);
+            }
+            
+            adminPins.delete(data.adminId);
+            activePins.delete(pin);
+        }
+    }
+}
+
+// Run cleanup every minute
+setInterval(cleanupExpiredPins, 60000);
 
 // Health check endpoint for Render
 app.get('/', (req, res) => {
@@ -73,13 +126,25 @@ wss.on('connection', (ws, req) => {
         serverTime: Date.now()
     }));
     
-    // Handle messages from client
-    ws.on('message', (message) => {
+    // Handle messages from client with rate limiting
+    ws.on('message', async (message) => {
         try {
+            // Apply rate limiting
+            await messageLimiter.consume(clientId).catch((rateLimiterRes) => {
+                ws.send(JSON.stringify({
+                    type: 'error',
+                    message: 'Too many requests. Please slow down.',
+                    retryAfter: Math.round(rateLimiterRes.msBeforeNext / 1000) || 60
+                }));
+                throw new Error('Rate limit exceeded');
+            });
+            
             const data = JSON.parse(message);
-            handleClientMessage(clientId, data);
+            await handleClientMessage(clientId, data);
         } catch (error) {
-            console.error('Error parsing message:', error);
+            if (error.message !== 'Rate limit exceeded') {
+                console.error('Error parsing message:', error);
+            }
         }
     });
     
@@ -98,6 +163,28 @@ wss.on('connection', (ws, req) => {
                 adminClients.delete(clientId);
                 adminGroups.delete(clientId);
                 wallConfigs.delete(clientId);
+                
+                // Clean up PIN if exists
+                const pin = adminPins.get(clientId);
+                if (pin) {
+                    const pinData = activePins.get(pin);
+                    if (pinData) {
+                        // Notify all clients paired with this PIN
+                        if (pinData.clientIds && pinData.clientIds.size > 0) {
+                            pinData.clientIds.forEach(pairedClientId => {
+                                const pairedClient = clients.get(pairedClientId);
+                                if (pairedClient && pairedClient.ws && pairedClient.ws.readyState === WebSocket.OPEN) {
+                                    pairedClient.ws.send(JSON.stringify({
+                                        type: 'unpaired',
+                                        reason: 'Admin disconnected'
+                                    }));
+                                }
+                            });
+                        }
+                    }
+                    activePins.delete(pin);
+                    adminPins.delete(clientId);
+                }
                 
                 // Notify paired clients that admin disconnected
                 if (pairedClients && pairedClients.size > 0) {
@@ -129,8 +216,12 @@ wss.on('connection', (ws, req) => {
                 clientPairings.delete(clientId);
             }
             
-            // Remove any pending pairing requests
-            pairingRequests.delete(clientId);
+            // Remove client from any PIN groups they joined
+            for (const [pin, data] of activePins.entries()) {
+                if (data.clientIds && data.clientIds.has(clientId)) {
+                    data.clientIds.delete(clientId);
+                }
+            }
         }
         
         clients.delete(clientId);
@@ -147,7 +238,7 @@ wss.on('connection', (ws, req) => {
 });
 
 // Handle messages from clients
-function handleClientMessage(clientId, data) {
+async function handleClientMessage(clientId, data) {
     const client = clients.get(clientId);
     if (!client) return;
     
@@ -195,75 +286,141 @@ function handleClientMessage(clientId, data) {
             }
             break;
             
-        case 'requestPairing':
-            // Admin requests to pair with a client
-            if (client.mode === 'admin' && data.clientId) {
-                const targetClient = clients.get(data.clientId);
-                if (targetClient && targetClient.mode === 'client' && targetClient.allowsPairing) {
-                    // Store pairing request
-                    pairingRequests.set(data.clientId, {
+        case 'generatePin':
+            // Admin generates a new PIN for pairing
+            if (client.mode === 'admin') {
+                try {
+                    // Apply rate limiting for PIN generation
+                    await pinGenerationLimiter.consume(clientId);
+                    
+                    // Remove old PIN if exists
+                    const oldPin = adminPins.get(clientId);
+                    if (oldPin) {
+                        activePins.delete(oldPin);
+                    }
+                    
+                    // Generate new PIN
+                    let pin;
+                    do {
+                        pin = generatePin();
+                    } while (activePins.has(pin));
+                    
+                    // Store PIN
+                    activePins.set(pin, {
                         adminId: clientId,
                         adminName: client.name,
-                        timestamp: Date.now()
+                        timestamp: Date.now(),
+                        clientIds: new Set()
                     });
+                    adminPins.set(clientId, pin);
                     
-                    // Send pairing request to client
-                    targetClient.ws.send(JSON.stringify({
-                        type: 'pairingRequest',
-                        adminId: clientId,
-                        adminName: client.name
+                    // Send PIN to admin
+                    client.ws.send(JSON.stringify({
+                        type: 'pinGenerated',
+                        pin: pin,
+                        expiresIn: 300 // 5 minutes in seconds
                     }));
                     
-                    console.log(`Pairing request from admin ${clientId} to client ${data.clientId}`);
+                    console.log(`Admin ${clientId} generated PIN: ${pin}`);
+                } catch (rateLimiterRes) {
+                    client.ws.send(JSON.stringify({
+                        type: 'error',
+                        message: 'Too many PIN generation attempts. Please wait.',
+                        retryAfter: Math.round(rateLimiterRes.msBeforeNext / 1000) || 60
+                    }));
                 }
             }
             break;
             
-        case 'pairingResponse':
-            // Client responds to pairing request
-            if (client.mode === 'client' && pairingRequests.has(clientId)) {
-                const request = pairingRequests.get(clientId);
-                const admin = clients.get(request.adminId);
-                
-                if (admin && data.accept) {
-                    // Accept pairing
-                    client.pairedWith = request.adminId;
-                    clientPairings.set(clientId, request.adminId);
+        case 'enterPin':
+            // Client enters PIN to pair with admin
+            if (client.mode === 'client' && data.pin) {
+                try {
+                    // Apply rate limiting for PIN attempts
+                    await pinAttemptLimiter.consume(clientId);
                     
-                    const adminGroup = adminGroups.get(request.adminId);
-                    if (adminGroup) {
-                        adminGroup.add(clientId);
-                    }
+                    const pinData = activePins.get(data.pin);
                     
-                    // Notify admin
-                    admin.ws.send(JSON.stringify({
-                        type: 'pairingAccepted',
-                        clientId: clientId,
-                        clientName: client.name
-                    }));
-                    
-                    // Notify client
-                    client.ws.send(JSON.stringify({
-                        type: 'paired',
-                        adminId: request.adminId,
-                        adminName: request.adminName
-                    }));
-                    
-                    console.log(`Client ${clientId} paired with admin ${request.adminId}`);
-                } else {
-                    // Reject pairing
-                    if (admin) {
-                        admin.ws.send(JSON.stringify({
-                            type: 'pairingRejected',
-                            clientId: clientId,
-                            clientName: client.name
+                    if (pinData) {
+                        // Check if PIN has expired
+                        const now = Date.now();
+                        if (now - pinData.timestamp > 5 * 60 * 1000) {
+                            client.ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'PIN has expired. Please request a new one.'
+                            }));
+                            // Clean up expired PIN
+                            adminPins.delete(pinData.adminId);
+                            activePins.delete(data.pin);
+                            return;
+                        }
+                        
+                        // Valid PIN found
+                        const admin = clients.get(pinData.adminId);
+                        
+                        if (admin && admin.ws && admin.ws.readyState === WebSocket.OPEN) {
+                            // Remove any existing pairing
+                            if (client.pairedWith) {
+                                const oldAdminGroup = adminGroups.get(client.pairedWith);
+                                if (oldAdminGroup) {
+                                    oldAdminGroup.delete(clientId);
+                                }
+                            }
+                            
+                            // Pair client with admin
+                            client.pairedWith = pinData.adminId;
+                            clientPairings.set(clientId, pinData.adminId);
+                            
+                            const adminGroup = adminGroups.get(pinData.adminId);
+                            if (adminGroup) {
+                                adminGroup.add(clientId);
+                            }
+                            
+                            // Add client to PIN group
+                            pinData.clientIds.add(clientId);
+                            
+                            // Notify admin
+                            admin.ws.send(JSON.stringify({
+                                type: 'clientPaired',
+                                clientId: clientId,
+                                clientName: client.name,
+                                pin: data.pin
+                            }));
+                            
+                            // Notify client
+                            client.ws.send(JSON.stringify({
+                                type: 'paired',
+                                adminId: pinData.adminId,
+                                adminName: pinData.adminName
+                            }));
+                            
+                            console.log(`Client ${clientId} paired with admin ${pinData.adminId} using PIN ${data.pin}`);
+                            broadcastClientList();
+                        } else {
+                            // Admin is no longer connected
+                            client.ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'Admin is no longer connected'
+                            }));
+                            // Clean up stale PIN
+                            adminPins.delete(pinData.adminId);
+                            activePins.delete(data.pin);
+                        }
+                    } else {
+                        // Invalid PIN
+                        client.ws.send(JSON.stringify({
+                            type: 'error',
+                            message: 'Invalid or expired PIN'
                         }));
+                        console.log(`Client ${clientId} entered invalid PIN: ${data.pin}`);
                     }
-                    console.log(`Client ${clientId} rejected pairing with admin ${request.adminId}`);
+                } catch (rateLimiterRes) {
+                    client.ws.send(JSON.stringify({
+                        type: 'error',
+                        message: 'Too many PIN attempts. Please wait.',
+                        retryAfter: Math.round(rateLimiterRes.msBeforeNext / 1000) || 60
+                    }));
                 }
-                
-                pairingRequests.delete(clientId);
-                broadcastClientList();
             }
             break;
             
@@ -355,14 +512,28 @@ function handleClientMessage(clientId, data) {
                     console.log(`Sent sync to admin ${clientId}`);
                     
                     // Send to all paired clients
-                    if (adminGroup) {
+                    if (adminGroup && adminGroup.size > 0) {
+                        let successCount = 0;
+                        let failCount = 0;
+                        
                         adminGroup.forEach(pairedClientId => {
                             const pairedClient = clients.get(pairedClientId);
-                            if (pairedClient && pairedClient.ws.readyState === WebSocket.OPEN) {
-                                pairedClient.ws.send(JSON.stringify(syncData));
-                                console.log(`Sent sync to client ${pairedClientId}`);
+                            if (pairedClient && pairedClient.ws && pairedClient.ws.readyState === WebSocket.OPEN) {
+                                try {
+                                    pairedClient.ws.send(JSON.stringify(syncData));
+                                    console.log(`Sent sync to client ${pairedClientId}`);
+                                    successCount++;
+                                } catch (error) {
+                                    console.error(`Failed to send sync to client ${pairedClientId}:`, error);
+                                    failCount++;
+                                }
+                            } else {
+                                console.warn(`Client ${pairedClientId} is not connected`);
+                                failCount++;
                             }
                         });
+                        
+                        console.log(`Sync sent: ${successCount} success, ${failCount} failed`);
                     }
                     
                     console.log(`Sync command sent from admin ${clientId} to ${adminGroup ? adminGroup.size : 0} paired clients`);
@@ -373,8 +544,9 @@ function handleClientMessage(clientId, data) {
             break;
             
         case 'unpair':
-            // Unpair client from admin
-            if (data.clientId) {
+            // Handle unpair from either admin or client
+            if (client.mode === 'admin' && data.clientId) {
+                // Admin unpairing a client
                 const targetClient = clients.get(data.clientId);
                 if (targetClient) {
                     const adminId = targetClient.pairedWith;
@@ -397,15 +569,36 @@ function handleClientMessage(clientId, data) {
                         broadcastClientList();
                     }
                 }
+            } else if (client.mode === 'client') {
+                // Client unpairing themselves
+                if (client.pairedWith) {
+                    const adminId = client.pairedWith;
+                    const adminGroup = adminGroups.get(adminId);
+                    if (adminGroup) {
+                        adminGroup.delete(clientId);
+                    }
+                    
+                    client.pairedWith = null;
+                    client.deviceIndex = null;
+                    clientPairings.delete(clientId);
+                    
+                    // Notify admin
+                    const admin = clients.get(adminId);
+                    if (admin && admin.ws.readyState === WebSocket.OPEN) {
+                        admin.ws.send(JSON.stringify({
+                            type: 'clientUnpaired',
+                            clientId: clientId,
+                            clientName: client.name
+                        }));
+                    }
+                    
+                    broadcastClientList();
+                }
             }
             break;
             
         case 'setPairingPreference':
-            // Client sets whether they allow pairing
-            if (client.mode === 'client') {
-                client.allowsPairing = data.allow;
-                broadcastClientList();
-            }
+            // Removed - no longer using direct pairing preferences with PIN system
             break;
             
         case 'ping':
@@ -469,13 +662,23 @@ function broadcastClientList() {
 // Ping clients periodically to keep connections alive
 setInterval(() => {
     clients.forEach((client, clientId) => {
-        if (client.ws.readyState === WebSocket.OPEN) {
-            client.ws.send(JSON.stringify({ type: 'ping' }));
-            
-            // Remove clients that haven't responded in 60 seconds
-            if (Date.now() - client.lastPing > 60000) {
-                console.log(`Removing inactive client: ${clientId}`);
-                client.ws.close();
+        if (client.ws && client.ws.readyState === WebSocket.OPEN) {
+            try {
+                client.ws.send(JSON.stringify({ type: 'ping' }));
+                
+                // Remove clients that haven't responded in 90 seconds (more lenient)
+                if (Date.now() - client.lastPing > 90000) {
+                    console.log(`Removing inactive client: ${clientId}`);
+                    client.ws.close();
+                }
+            } catch (error) {
+                console.error(`Error pinging client ${clientId}:`, error);
+                // Force close if we can't ping
+                try {
+                    client.ws.close();
+                } catch (closeError) {
+                    console.error(`Error closing client ${clientId}:`, closeError);
+                }
             }
         }
     });
