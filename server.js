@@ -309,7 +309,7 @@ async function handleClientMessage(clientId, data) {
         case 'listClients':
             // Send list of available clients to admin
             if (client.mode === 'admin') {
-                const clientList = Array.from(clients.values())
+                const allClients = Array.from(clients.values())
                     .filter(c => c.mode === 'client')
                     .map(c => ({
                         id: c.id,
@@ -317,14 +317,18 @@ async function handleClientMessage(clientId, data) {
                         paired: c.pairedWith !== null,
                         pairedWith: c.pairedWith,
                         deviceIndex: c.deviceIndex,
-                        allowsPairing: c.allowsPairing
+                        connected: c.ws && c.ws.readyState === WebSocket.OPEN
                     }));
+                
+                const myPairedClients = Array.from(adminGroups.get(clientId) || []);
+                
+                console.log(`Admin ${clientId} requested client list: ${allClients.length} clients, ${myPairedClients.length} paired`);
                 
                 client.ws.send(JSON.stringify({
                     type: 'clientList',
                     adminId: clientId,
-                    clients: clientList,
-                    pairedClients: Array.from(adminGroups.get(clientId) || [])
+                    clients: allClients,
+                    pairedClients: myPairedClients
                 }));
             }
             break;
@@ -455,11 +459,13 @@ async function handleClientMessage(clientId, data) {
                         }
                     } else {
                         // Invalid PIN
+                        console.log(`Client ${clientId} entered invalid PIN: ${data.pin}`);
+                        console.log('Available PINs:', Array.from(activePins.keys()));
+                        
                         client.ws.send(JSON.stringify({
                             type: 'error',
-                            message: 'Invalid or expired PIN'
+                            message: 'Invalid PIN. Check the 6-digit code and try again.'
                         }));
-                        console.log(`Client ${clientId} entered invalid PIN: ${data.pin}`);
                     }
                 } catch (rateLimiterRes) {
                     client.ws.send(JSON.stringify({
@@ -768,10 +774,11 @@ function broadcastToAll(message) {
 
 // Broadcast client list to all admins
 function broadcastClientList() {
+    console.log(`Broadcasting client list to ${adminClients.size} admins`);
     adminClients.forEach((adminId) => {
         const admin = clients.get(adminId);
-        if (admin && admin.ws.readyState === WebSocket.OPEN) {
-            const clientList = Array.from(clients.values())
+        if (admin && admin.ws && admin.ws.readyState === WebSocket.OPEN) {
+            const allClients = Array.from(clients.values())
                 .filter(c => c.mode === 'client')
                 .map(c => ({
                     id: c.id,
@@ -779,14 +786,18 @@ function broadcastClientList() {
                     paired: c.pairedWith !== null,
                     pairedWith: c.pairedWith,
                     deviceIndex: c.deviceIndex,
-                    allowsPairing: c.allowsPairing
+                    connected: c.ws && c.ws.readyState === WebSocket.OPEN
                 }));
+            
+            const myPairedClients = Array.from(adminGroups.get(adminId) || []);
+            
+            console.log(`Sending to admin ${adminId}: ${allClients.length} total clients, ${myPairedClients.length} paired`);
             
             admin.ws.send(JSON.stringify({
                 type: 'clientList',
                 adminId: adminId,
-                clients: clientList,
-                pairedClients: Array.from(adminGroups.get(adminId) || [])
+                clients: allClients,
+                pairedClients: myPairedClients
             }));
         }
     });
