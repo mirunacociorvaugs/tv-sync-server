@@ -75,9 +75,12 @@ function generatePin() {
 function cleanupExpiredPins() {
     const now = Date.now();
     const expireTime = 5 * 60 * 1000; // 5 minutes
+    const pinsToDelete = [];
     
     for (const [pin, data] of activePins.entries()) {
         if (now - data.timestamp > expireTime) {
+            pinsToDelete.push(pin);
+            
             // Notify admin that PIN expired
             const admin = clients.get(data.adminId);
             if (admin && admin.ws && admin.ws.readyState === WebSocket.OPEN) {
@@ -87,18 +90,31 @@ function cleanupExpiredPins() {
                 }));
             }
             
-            // Clean up all clients that used this PIN
+            // Notify all clients that used this PIN
             if (data.usedBy && data.usedBy.size > 0) {
                 console.log(`Cleaning up ${data.usedBy.size} clients from expired PIN ${pin}`);
+                data.usedBy.forEach(clientId => {
+                    const client = clients.get(clientId);
+                    if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
+                        client.ws.send(JSON.stringify({
+                            type: 'pinExpired',
+                            message: 'PIN has expired'
+                        }));
+                    }
+                });
             }
-            
-            // Add to used PINs to prevent immediate reuse
-            usedPins.add(pin);
-            
-            adminPins.delete(data.adminId);
-            activePins.delete(pin);
         }
     }
+    
+    // Delete expired PINs after iteration to avoid modification during iteration
+    pinsToDelete.forEach(pin => {
+        const data = activePins.get(pin);
+        if (data) {
+            adminPins.delete(data.adminId);
+            usedPins.add(pin);
+        }
+        activePins.delete(pin);
+    });
     
     // Clean up old used PINs (older than 30 minutes)
     if (usedPins.size > 1000) {
@@ -152,6 +168,8 @@ wss.on('connection', (ws, req) => {
         serverTime: Date.now()
     }));
     
+    console.log(`Client ${clientId} connected. Total clients: ${clients.size}`);
+    
     // Handle messages from client with rate limiting
     ws.on('message', async (message) => {
         try {
@@ -204,10 +222,14 @@ wss.on('connection', (ws, req) => {
                                         type: 'unpaired',
                                         reason: 'Admin disconnected'
                                     }));
+                                    // Also clean up pairing state
+                                    pairedClient.pairedWith = null;
+                                    pairedClient.deviceIndex = null;
                                 }
                             });
                         }
                     }
+                    // Ensure PIN is marked as used before deletion
                     usedPins.add(pin);
                     activePins.delete(pin);
                     adminPins.delete(clientId);
@@ -273,7 +295,8 @@ wss.on('connection', (ws, req) => {
         console.error(`WebSocket error for client ${clientId}:`, error);
     });
     
-    // Send initial client list
+    // Send initial client list and notify of new connection
+    console.log('Broadcasting initial client list to all admins');
     broadcastClientList();
 });
 
@@ -303,7 +326,13 @@ async function handleClientMessage(clientId, data) {
             }
             
             console.log(`Client ${clientId} registered as ${data.mode} (${client.name})`);
-            broadcastClientList();
+            console.log(`Current clients: ${Array.from(clients.values()).map(c => `${c.name}(${c.mode})`).join(', ')}`);
+            
+            // Immediately broadcast to all admins
+            setTimeout(() => {
+                console.log('Broadcasting client list after registration');
+                broadcastClientList();
+            }, 100); // Small delay to ensure registration is complete
             break;
             
         case 'listClients':
