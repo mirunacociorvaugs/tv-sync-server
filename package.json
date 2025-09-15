@@ -1,15 +1,22 @@
 {
-  "name": "video-wall-server",
+  "name": "sync-wall-server",
   "version": "1.0.0",
-  "description": "WebSocket server for video wall synchronization",
+  "type": "module",
   "main": "server.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
   },
   "dependencies": {
-    "ws": "^8.14.2",
-    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "rate-limiter-flexible": "^2.4.1"
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "rate-limiter-flexible": "^5.0.3",
+    "uuid": "^9.0.1",
+    "ws": "^8.17.0"
   }
 }
